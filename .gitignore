@@ -2,3 +2,4 @@ _build/
 *.opam
 .merlin
 .claude/
+CLAUDE.md
