@@ -1,0 +1,11 @@
+(test
+ (name test_book)
+ (modules test_book)
+ (libraries matching_engine alcotest base)
+ (preprocess (pps ppx_jane)))
+
+(test
+ (name test_properties)
+ (modules test_properties)
+ (libraries matching_engine qcheck qcheck-alcotest alcotest base)
+ (preprocess (pps ppx_jane)))

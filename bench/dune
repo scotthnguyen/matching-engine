@@ -1,0 +1,4 @@
+(executable
+ (name bench_matching)
+ (libraries matching_engine core core_bench base)
+ (preprocess (pps ppx_jane)))
