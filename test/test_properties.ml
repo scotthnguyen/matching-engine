@@ -9,7 +9,7 @@ let gen_side  = QCheck.Gen.(map (fun b -> if b then Order.Side.Buy else Order.Si
 type action =
   | Submit_limit  of { side : Order.Side.t; price : int; qty : int }
   | Submit_market of { side : Order.Side.t; qty : int }
-  | Cancel        of int  (* index into live_ids list at run time *)
+  | Cancel        of int  (* index into live_ids at run time *)
 
 let gen_action live_count =
   QCheck.Gen.(
@@ -42,36 +42,80 @@ let gen_actions n =
 (* ---- Session state ---- *)
 
 type session = {
-  book     : Book.t;
-  live_ids : int list;
-  next_id  : int;
+  book                 : Book.t;
+  live_ids             : int list;
+  next_id              : int;
+  (* Quantity accounting — see qty_conservation_holds for the invariant. *)
+  total_limit_qty      : int;  (* sum of Q for every submitted limit order *)
+  total_limit_fill_qty : int;  (* fill qty that came from limit order submissions *)
+  total_market_fill_qty: int;  (* fill qty that came from market order submissions *)
+  total_canceled_qty   : int;  (* remaining qty at the time of each successful cancel *)
 }
 
-let init_session = { book = Book.empty; live_ids = []; next_id = 1 }
+let init_session = {
+  book                  = Book.empty;
+  live_ids              = [];
+  next_id               = 1;
+  total_limit_qty       = 0;
+  total_limit_fill_qty  = 0;
+  total_market_fill_qty = 0;
+  total_canceled_qty    = 0;
+}
 
-let run_action s action =
+let sum_fill_qty fills =
+  List.fold fills ~init:0 ~f:(fun acc f -> acc + f.Fill.qty)
+
+(* Returns (new_session, fills) so callers can inspect fills without re-running. *)
+let run_action_with_fills s action =
   match action with
   | Submit_limit { side; price; qty } ->
     let order = Order.create ~id:s.next_id ~side ~price ~qty ~timestamp:s.next_id in
     let (book', fills) = Matching_engine.submit_limit_order s.book order in
-    let filled_qty = List.fold fills ~init:0 ~f:(fun acc f -> acc + f.Fill.qty) in
+    let fq = sum_fill_qty fills in
     let live_ids' =
-      if qty - filled_qty > 0 then s.next_id :: s.live_ids
-      else s.live_ids
+      if qty - fq > 0 then s.next_id :: s.live_ids else s.live_ids
     in
-    { book = book'; live_ids = live_ids'; next_id = s.next_id + 1 }
+    ({ s with
+       book                 = book';
+       live_ids             = live_ids';
+       next_id              = s.next_id + 1;
+       total_limit_qty      = s.total_limit_qty + qty;
+       total_limit_fill_qty = s.total_limit_fill_qty + fq;
+     }, fills)
+
   | Submit_market { side; qty } ->
-    let (book', _fills) = Matching_engine.submit_market_order s.book side ~qty in
-    { s with book = book' }
+    let (book', fills) = Matching_engine.submit_market_order s.book side ~qty in
+    let fq = sum_fill_qty fills in
+    ({ s with
+       book                  = book';
+       total_market_fill_qty = s.total_market_fill_qty + fq;
+     }, fills)
+
   | Cancel idx ->
     (match s.live_ids with
-     | [] -> s
+     | [] -> (s, [])
      | ids ->
        let id_to_cancel = List.nth_exn ids (idx % List.length ids) in
        let live_ids' = List.filter ids ~f:(fun i -> i <> id_to_cancel) in
        (match Matching_engine.cancel_order s.book ~order_id:id_to_cancel with
-        | None    -> { s with live_ids = live_ids' }
-        | Some b' -> { s with book = b'; live_ids = live_ids' }))
+        | None    -> ({ s with live_ids = live_ids' }, [])
+        | Some b' ->
+          (* Compute how much qty was removed from the book by this cancel. *)
+          let resting_before =
+            let sum snaps = List.fold snaps ~init:0 ~f:(fun acc (_, q) -> acc + q) in
+            sum (Book.bids_snapshot s.book) + sum (Book.asks_snapshot s.book)
+          in
+          let resting_after =
+            let sum snaps = List.fold snaps ~init:0 ~f:(fun acc (_, q) -> acc + q) in
+            sum (Book.bids_snapshot b') + sum (Book.asks_snapshot b')
+          in
+          ({ s with
+             book               = b';
+             live_ids           = live_ids';
+             total_canceled_qty = s.total_canceled_qty + (resting_before - resting_after);
+           }, [])))
+
+let run_action s action = fst (run_action_with_fills s action)
 
 let run_session actions =
   List.fold actions ~init:init_session ~f:run_action
@@ -84,10 +128,35 @@ let no_crossed_book book =
   | _                  -> true
 
 let no_zero_qty_levels book =
-  let ok snapshots = List.for_all snapshots ~f:(fun (_, qty) -> qty > 0) in
+  let ok snaps = List.for_all snaps ~f:(fun (_, qty) -> qty > 0) in
   ok (Book.bids_snapshot book) && ok (Book.asks_snapshot book)
 
 let non_negative_size book = Book.size book >= 0
+
+(* Quantity conservation:
+   Each limit order of qty Q contributes Q units to the system.
+   A limit-order submission with fill_qty f:
+     - removes 2f units (f from the resting opposing orders, f from the incoming)
+     - nets Q - 2f into current_resting
+   A market order with fill_qty f:
+     - removes f units from resting orders (the market side never rests)
+     - nets -f into current_resting
+   A cancel removes the remaining qty of the canceled order from current_resting.
+
+   Therefore: current_resting =
+     total_limit_qty - 2*total_limit_fill_qty - total_market_fill_qty - total_canceled_qty *)
+let qty_conservation_holds s =
+  let actual_resting =
+    let sum snaps = List.fold snaps ~init:0 ~f:(fun acc (_, q) -> acc + q) in
+    sum (Book.bids_snapshot s.book) + sum (Book.asks_snapshot s.book)
+  in
+  let expected_resting =
+    s.total_limit_qty
+    - 2 * s.total_limit_fill_qty
+    - s.total_market_fill_qty
+    - s.total_canceled_qty
+  in
+  actual_resting = expected_resting
 
 (* ---- Properties ---- *)
 
@@ -116,22 +185,20 @@ let prop_fill_prices_positive =
     (fun actions ->
       let (_, ok) =
         List.fold actions ~init:(init_session, true) ~f:(fun (s, ok) action ->
-          let (book', new_fills) =
-            match action with
-            | Submit_limit { side; price; qty } ->
-              let order = Order.create ~id:s.next_id ~side ~price ~qty ~timestamp:s.next_id in
-              Matching_engine.submit_limit_order s.book order
-            | Submit_market { side; qty } ->
-              Matching_engine.submit_market_order s.book side ~qty
-            | Cancel _ ->
-              (s.book, [])
-          in
-          let s' = run_action { s with book = book' } (match action with
-            | Submit_limit a  -> Submit_limit a
-            | Submit_market a -> Submit_market a
-            | Cancel i        -> Cancel i) in
-          let fills_valid = List.for_all new_fills ~f:(fun f -> f.Fill.price > 0 && f.Fill.qty > 0) in
-          (s', ok && fills_valid))
+          let (s', fills) = run_action_with_fills s action in
+          let valid = List.for_all fills ~f:(fun f -> f.Fill.price > 0 && f.Fill.qty > 0) in
+          (s', ok && valid))
+      in
+      ok)
+
+let prop_qty_conservation =
+  QCheck.Test.make ~name:"quantity conservation holds after every step" ~count:500
+    (arb_actions 40)
+    (fun actions ->
+      let (_, ok) =
+        List.fold actions ~init:(init_session, true) ~f:(fun (s, ok) action ->
+          let s' = run_action s action in
+          (s', ok && qty_conservation_holds s'))
       in
       ok)
 
@@ -154,6 +221,7 @@ let () =
     prop_no_zero_qty;
     prop_non_negative_size;
     prop_fill_prices_positive;
+    prop_qty_conservation;
     prop_invariant_every_step;
   ] in
   Alcotest.run "Property-based invariants"
